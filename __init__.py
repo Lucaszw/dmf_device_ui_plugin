@@ -35,6 +35,7 @@ from path_helpers import path
 from pygtkhelpers.utils import refresh_gui
 from si_prefix import si_format
 import gobject
+import paho_mqtt_helpers as pmh
 import pandas as pd
 
 logger = logging.getLogger(__name__)
@@ -43,7 +44,8 @@ logger = logging.getLogger(__name__)
 PluginGlobals.push_env('microdrop.managed')
 
 
-class DmfDeviceUiPlugin(AppDataController, StepOptionsController, Plugin):
+class DmfDeviceUiPlugin(AppDataController, StepOptionsController, Plugin,
+                         pmh.BaseMqttReactor):
     """
     This class is automatically registered with the PluginManager.
     """
@@ -81,6 +83,10 @@ class DmfDeviceUiPlugin(AppDataController, StepOptionsController, Plugin):
         self.gui_heartbeat_id = None
         self._gui_enabled = False
         self.alive_timestamp = None
+        self.should_terminate = False
+        pmh.BaseMqttReactor.__init__(self)
+        self.start()
+        self.mqtt_client.subscribe('microdrop/dmf-device-ui/get-video-settings')
 
     def reset_gui(self):
         py_exe = sys.executable
@@ -118,44 +124,19 @@ class DmfDeviceUiPlugin(AppDataController, StepOptionsController, Plugin):
                 return True
         # Go back to Undo 613 for working corners
         self.step_video_settings = None
-        self.wait_for_gui_process()
         # Get current video settings from UI.
         app_values = self.get_app_values()
         # Convert JSON settings to 0MQ plugin API Python types.
         ui_settings = self.json_settings_as_python(app_values)
+
         self.set_ui_settings(ui_settings, default_corners=True)
         self.gui_heartbeat_id = gobject.timeout_add(1000, keep_alive)
 
     def cleanup(self):
         if self.gui_heartbeat_id is not None:
             gobject.source_remove(self.gui_heartbeat_id)
-        if self.gui_process is not None:
-            # XXX Use `hub_execute` here rather than `hub_execute_async` to
-            # ensure command is processed prior to the hub being closed during
-            # processing of `on_app_exit` signal.
-            hub_execute(self.name, 'terminate')
-        self.alive_timestamp = None
 
-    def wait_for_gui_process(self, retry_count=20, retry_duration_s=1):
-        start = datetime.now()
-        for i in xrange(retry_count):
-            try:
-                hub_execute(self.name, 'ping', wait_func=lambda *args:
-                            refresh_gui(), timeout_s=5, silent=True)
-            except:
-                logger.debug('[wait_for_gui_process] failed (%d of %d)', i + 1,
-                             retry_count, exc_info=True)
-            else:
-                logger.info('[wait_for_gui_process] success (%d of %d)', i + 1,
-                            retry_count)
-                self.alive_timestamp = datetime.now()
-                return
-            for j in xrange(10):
-                time.sleep(retry_duration_s / 10.)
-                refresh_gui()
-        raise IOError('Timed out after %ss waiting for GUI process to connect '
-                      'to hub.' % si_format((datetime.now() -
-                                             start).total_seconds()))
+        self.alive_timestamp = None
 
     def get_schedule_requests(self, function_name):
         """
@@ -172,83 +153,9 @@ class DmfDeviceUiPlugin(AppDataController, StepOptionsController, Plugin):
         return []
 
     def on_app_exit(self):
-        json_settings = self.get_ui_json_settings()
-        self.save_ui_settings(json_settings)
-        self._gui_enabled = False
-        self.cleanup()
-
-    # #########################################################################
-    # # DMF device UI 0MQ plugin settings
-    def get_ui_json_settings(self):
-        '''
-        Get current video settings from DMF device UI plugin.
-
-        Returns
-        -------
-
-            (dict) : DMF device UI plugin settings in JSON-compatible format
-                (i.e., only basic Python data types).
-        '''
-        video_settings = {}
-
-        # Try to request video configuration.
-        try:
-            video_config = hub_execute(self.name, 'get_video_config',
-                                       wait_func=lambda *args: refresh_gui(),
-                                       timeout_s=2)
-        except IOError:
-            logger.warning('Timed out waiting for device window size and '
-                           'position request.')
-        else:
-            if video_config is not None:
-                video_settings['video_config'] = video_config.to_json()
-            else:
-                video_settings['video_config'] = ''
-
-        # Try to request allocation to save in app options.
-        try:
-            data = hub_execute(self.name, 'get_corners', wait_func=lambda
-                               *args: refresh_gui(), timeout_s=2)
-        except IOError:
-            logger.warning('Timed out waiting for device window size and '
-                           'position request.')
-        else:
-            if data:
-                # Get window allocation settings (i.e., width, height, x, y).
-
-                # Replace `df_..._corners` with CSV string named `..._corners`
-                # (no `df_` prefix).
-                for k in ('df_canvas_corners', 'df_frame_corners'):
-                    if k in data:
-                        data['allocation'][k[3:]] = data.pop(k).to_csv()
-                video_settings.update(data['allocation'])
-
-        # Try to request surface alphas.
-        try:
-            surface_alphas = hub_execute(self.name, 'get_surface_alphas',
-                                         wait_func=lambda *args: refresh_gui(),
-                                         timeout_s=2)
-        except IOError:
-            logger.warning('Timed out waiting for surface alphas.')
-        else:
-            if surface_alphas is not None:
-                video_settings['surface_alphas'] = surface_alphas.to_json()
-            else:
-                video_settings['surface_alphas'] = ''
-        return video_settings
-
-    def get_ui_settings(self):
-        '''
-        Get current video settings from DMF device UI plugin.
-
-        Returns
-        -------
-
-            (dict) : DMF device UI plugin settings in Python types expected by
-                DMF device UI plugin 0MQ commands.
-        '''
-        json_settings = self.get_ui_json_settings()
-        return self.json_settings_as_python(json_settings)
+        self.should_terminate = True
+        self.mqtt_client.publish('microdrop/dmf-device-ui-plugin/get-video-settings',
+                                 json.dumps(None))
 
     def json_settings_as_python(self, json_settings):
         '''
@@ -324,35 +231,45 @@ class DmfDeviceUiPlugin(AppDataController, StepOptionsController, Plugin):
             ui_settings (dict) : DMF device UI plugin settings in format
                 returned by `json_settings_as_python` method.
         '''
-        if self.alive_timestamp is None or self.gui_process is None:
-            # Repeat until GUI process has started.
-            raise IOError('GUI process not ready.')
 
         if 'video_config' in ui_settings:
-            hub_execute(self.name, 'set_video_config',
-                        video_config=ui_settings['video_config'],
-                        wait_func=lambda *args: refresh_gui(), timeout_s=5)
+            msg = {}
+            msg['video_config'] = ui_settings['video_config'].to_json()
+            self.mqtt_client.publish('microdrop/dmf-device-ui-plugin/set-video-config',
+                                      payload=json.dumps(msg), retain=True)
 
         if 'surface_alphas' in ui_settings:
-            hub_execute(self.name, 'set_surface_alphas',
-                        surface_alphas=ui_settings['surface_alphas'],
-                        wait_func=lambda *args: refresh_gui(), timeout_s=5)
+            # TODO: Make Clear retained messages after exit
+            msg = {}
+            msg['surface_alphas'] = ui_settings['surface_alphas'].to_json()
+            self.mqtt_client.publish('microdrop/dmf-device-ui-plugin/set-surface-alphas',
+                                      payload=json.dumps(msg), retain=True)
 
         if all((k in ui_settings) for k in ('df_canvas_corners',
                                             'df_frame_corners')):
+            # TODO: Test With Camera
+            msg = {}
+            msg['df_canvas_corners'] = ui_settings['df_canvas_corners'].to_json()
+            msg['df_frame_corners']  = ui_settings['df_frame_corners'].to_json()
+
             if default_corners:
-                hub_execute(self.name, 'set_default_corners',
-                            canvas=ui_settings['df_canvas_corners'],
-                            frame=ui_settings['df_frame_corners'],
-                            wait_func=lambda *args: refresh_gui(), timeout_s=5)
+                self.mqtt_client.publish('microdrop/dmf-device-ui-plugin/'
+                                          'set-default-corners',
+                                          payload=json.dumps(msg), retain=True)
             else:
-                hub_execute(self.name, 'set_corners',
-                            df_canvas_corners=ui_settings['df_canvas_corners'],
-                            df_frame_corners=ui_settings['df_frame_corners'],
-                            wait_func=lambda *args: refresh_gui(), timeout_s=5)
+                self.mqtt_client.publish('microdrop/dmf-device-ui-plugin/'
+                                          'set-corners',
+                                          payload=json.dumps(msg), retain=True)
 
     # #########################################################################
     # # Plugin signal handlers
+    def on_message(self, client, userdata, msg):
+        if msg.topic == 'microdrop/dmf-device-ui/get-video-settings':
+            self.video_settings = json.loads(msg.payload)
+            self.save_ui_settings(self.video_settings)
+            if self.should_terminate:
+                self.mqtt_client.publish('microdrop/dmf-device-ui-plugin/terminate')
+
     def on_plugin_disable(self):
         self._gui_enabled = False
         self.cleanup()
