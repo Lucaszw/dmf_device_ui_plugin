@@ -25,6 +25,7 @@ import sys
 import time
 
 from flatland import Boolean, Form, Integer, String
+from flatland_helpers import flatlandToDict
 from microdrop.plugin_helpers import (AppDataController, StepOptionsController,
                                       get_plugin_info, hub_execute,
                                       hub_execute_async)
@@ -37,6 +38,7 @@ from si_prefix import si_format
 import gobject
 import paho_mqtt_helpers as pmh
 import pandas as pd
+from zmq_plugin.schema import PandasJsonEncoder
 
 logger = logging.getLogger(__name__)
 
@@ -87,6 +89,7 @@ class DmfDeviceUiPlugin(AppDataController, StepOptionsController, Plugin,
         pmh.BaseMqttReactor.__init__(self)
         self.start()
         self.mqtt_client.subscribe('microdrop/dmf-device-ui/get-video-settings')
+        self.mqtt_client.subscribe('microdrop/dmf-device-ui/update-protocol')
 
     def reset_gui(self):
         py_exe = sys.executable
@@ -145,6 +148,11 @@ class DmfDeviceUiPlugin(AppDataController, StepOptionsController, Plugin,
         """
         if function_name == 'on_plugin_enable':
             return [ScheduleRequest('droplet_planning_plugin', self.name)]
+        elif function_name == 'on_dmf_device_swapped':
+            # XXX Schedule `on_app_exit` handling before `device_info_plugin`,
+            # since `hub_execute` uses the `device_info_plugin` service to
+            # submit commands to through the 0MQ plugin hub.
+            return [ScheduleRequest('microdrop.device_info_plugin',self.name)]
         elif function_name == 'on_app_exit':
             # XXX Schedule `on_app_exit` handling before `device_info_plugin`,
             # since `hub_execute` uses the `device_info_plugin` service to
@@ -269,14 +277,36 @@ class DmfDeviceUiPlugin(AppDataController, StepOptionsController, Plugin,
             self.save_ui_settings(self.video_settings)
             if self.should_terminate:
                 self.mqtt_client.publish('microdrop/dmf-device-ui-plugin/terminate')
+        if msg.topic == 'microdrop/dmf-device-ui/update-protocol':
+            self.update_protocol(json.loads(msg.payload))
 
     def on_plugin_disable(self):
         self._gui_enabled = False
         self.cleanup()
 
+
     def on_plugin_enable(self):
         super(DmfDeviceUiPlugin, self).on_plugin_enable()
         self.reset_gui()
+
+        form = flatlandToDict(self.StepFields)
+        self.mqtt_client.publish('microdrop/dmf-device-ui-plugin/schema',
+                                  json.dumps(form),
+                                  retain=True)
+        defaults = {}
+        for k,v in form.iteritems():
+            defaults[k] = v['default']
+
+        # defaults = map(lambda (k,v): {k: v['default']}, form.iteritems())
+        self.mqtt_client.publish('microdrop/dmf-device-ui-plugin/step-options',
+                                  json.dumps([defaults], cls=PandasJsonEncoder),
+                                  retain=True)
+
+    def on_step_removed(self, step_number, step):
+        self.update_steps()
+
+    def on_step_options_changed(self, plugin, step_number):
+        self.update_steps()
 
     def on_step_run(self):
         '''
@@ -287,19 +317,46 @@ class DmfDeviceUiPlugin(AppDataController, StepOptionsController, Plugin,
         until all plugins have completed the current step before proceeding.
         '''
         app = get_app()
-
-        if (app.realtime_mode or app.running) and self.gui_process is not None:
-            step_options = self.get_step_options()
-            if not step_options['video_enabled']:
-                hub_execute(self.name, 'disable_video',
-                            wait_func=lambda *args: refresh_gui(), timeout_s=5,
-                            silent=True)
-            else:
-                hub_execute(self.name, 'enable_video',
-                            wait_func=lambda *args: refresh_gui(), timeout_s=5,
-                            silent=True)
+        # TODO: Migrate video commands to mqtt!!
+        # if (app.realtime_mode or app.running) and self.gui_process is not None:
+        #     step_options = self.get_step_options()
+        #     if not step_options['video_enabled']:
+        #         hub_execute(self.name, 'disable_video',
+        #                     wait_func=lambda *args: refresh_gui(), timeout_s=5,
+        #                     silent=True)
+        #     else:
+        #         hub_execute(self.name, 'enable_video',
+        #                     wait_func=lambda *args: refresh_gui(), timeout_s=5,
+        #                     silent=True)
         emit_signal('on_step_complete', [self.name, None])
 
+    def update_steps(self):
+        app = get_app()
+        num_steps = len(app.protocol.steps)
+
+        protocol = []
+        for i in range(num_steps):
+            protocol.append(self.get_step_options(i))
+
+        self.mqtt_client.publish('microdrop/dmf-device-ui-plugin/step-options',
+                                  json.dumps(protocol, cls=PandasJsonEncoder),
+                                  retain=True)
+
+    def update_protocol(self, protocol):
+        app = get_app()
+
+        for i, s in enumerate(protocol):
+
+            step = app.protocol.steps[i]
+            prevData = step.get_data(self.plugin_name)
+            values = {}
+
+            for k,v in prevData.iteritems():
+                values[k] = s[k]
+
+            step.set_data(self.plugin_name, values)
+            emit_signal('on_step_options_changed', [self.plugin_name, i],
+                        interface=IPlugin)
 
 PluginGlobals.pop_env()
 
