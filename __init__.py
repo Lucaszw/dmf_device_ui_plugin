@@ -88,8 +88,6 @@ class DmfDeviceUiPlugin(AppDataController, StepOptionsController, Plugin,
         self.should_terminate = False
         pmh.BaseMqttReactor.__init__(self)
         self.start()
-        self.mqtt_client.subscribe('microdrop/dmf-device-ui/get-video-settings')
-        self.mqtt_client.subscribe('microdrop/dmf-device-ui/update-protocol')
 
     def reset_gui(self):
         py_exe = sys.executable
@@ -271,6 +269,10 @@ class DmfDeviceUiPlugin(AppDataController, StepOptionsController, Plugin,
 
     # #########################################################################
     # # Plugin signal handlers
+    def on_connect(self, client, userdata, flags, rc):
+        self.mqtt_client.subscribe('microdrop/dmf-device-ui/get-video-settings')
+        self.mqtt_client.subscribe('microdrop/dmf-device-ui/update-protocol')
+
     def on_message(self, client, userdata, msg):
         if msg.topic == 'microdrop/dmf-device-ui/get-video-settings':
             self.video_settings = json.loads(msg.payload)
@@ -352,7 +354,8 @@ class DmfDeviceUiPlugin(AppDataController, StepOptionsController, Plugin,
             values = {}
 
             for k,v in prevData.iteritems():
-                values[k] = s[k]
+                if k in s:
+                    values[k] = s[k]
 
             step.set_data(self.plugin_name, values)
             emit_signal('on_step_options_changed', [self.plugin_name, i],
